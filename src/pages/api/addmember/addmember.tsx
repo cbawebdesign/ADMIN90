@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { initializeApp, getApps } from 'firebase/app';
-import { getFirestore, doc, updateDoc, arrayUnion } from 'firebase/firestore';
+import { getFirestore, doc, updateDoc, arrayUnion, setDoc, writeBatch, getDocs, collection, query } from 'firebase/firestore';
+import admin from 'firebase-admin';
 
 // Firebase configuration
 const firebaseConfig = {
@@ -21,17 +22,112 @@ if (!getApps().length) {
   app = getApps()[0];
 }
 
+// Initialize Firebase Admin
+if (!admin.apps.length) {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY as string);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+}
+
 const db = getFirestore(app);
+const auth = admin.auth();
+
+const generateRandomId = async (): Promise<string> => {
+  const generateId = () => `DALP${Math.floor(Math.random() * 90000) + 10000}`;
+  let uniqueId = generateId();
+
+  // Ensure the generated ID is unique by checking the Firestore database
+  const usersRef = collection(db, 'users');
+  const q = query(usersRef);
+  const snapshot = await getDocs(q);
+
+  const ids = new Set<string>();
+  snapshot.forEach((doc) => {
+    ids.add(doc.data().userName);
+  });
+
+  while (ids.has(uniqueId)) {
+    uniqueId = generateId();
+  }
+
+  return uniqueId;
+};
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method === 'POST') {
     try {
       const { groupId, newMember } = req.body;
       const groupRef = doc(db, 'groups', groupId);
-      await updateDoc(groupRef, {
-        users: arrayUnion(newMember),
+
+      // Generate a unique ID
+      const uniqueId = await generateRandomId();
+
+      // Create a new user with Firebase Admin SDK using the provided ID as userName
+      const randomPassword = Math.random().toString(36).slice(-8);
+      const userRecord = await auth.createUser({
+        email: newMember.email,
+        password: randomPassword,
+        displayName: newMember.name
       });
-      res.status(200).json({ message: 'Member added successfully' });
+
+      // Set custom claims for the user
+      await auth.setCustomUserClaims(userRecord.uid, { 
+        userName: uniqueId,
+        onboarded: true // User is considered onboarded immediately
+      });
+
+      // Firestore batch write
+      const batch = writeBatch(db);
+      
+      // Organization document reference
+      const organizationRef = doc(db, 'organizations', groupId); // Ensure the groupId matches organizationId
+      
+      // User document reference
+      const userRef = doc(db, 'users', userRecord.uid);
+      
+      const organizationMembers = {
+        [userRecord.uid]: {
+          user: userRef,
+          role: 'Member', // Assuming the role is 'Member'; adjust as needed
+        },
+      };
+
+      // Add user to organization's members
+      batch.set(organizationRef, {
+        members: organizationMembers,
+      }, { merge: true });
+
+      // Add the new user to the Firestore 'users' collection
+      batch.set(userRef, {
+        name: newMember.name,
+        email: newMember.email,
+        userName: uniqueId,
+        createdAt: new Date().toISOString(),
+        onboarded: true // User is considered onboarded immediately
+      });
+
+      // Commit the batch
+      await batch.commit();
+
+      // Log the temporary password in the 'passlogs' Firestore collection
+      const passwordLogRef = doc(db, 'passlogs', userRecord.uid);
+      await setDoc(passwordLogRef, {
+        email: newMember.email,
+        tempPassword: randomPassword,
+        createdAt: new Date().toISOString()
+      });
+
+      // Add the new member to the group's users array
+      await updateDoc(groupRef, {
+        users: arrayUnion({
+          id: userRecord.uid,
+          name: newMember.name,
+          email: newMember.email
+        }),
+      });
+
+      res.status(200).json({ message: 'Member added and user account created successfully' });
     } catch (error) {
       const errMsg = (error instanceof Error) ? error.message : 'Unknown error occurred';
       console.error('Error adding member:', errMsg);
